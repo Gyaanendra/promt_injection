@@ -6,6 +6,7 @@ function App() {
   const [messages, setMessages] = useState([]);   // { role: 'user'|'assistant', content: string }
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [streamingContent, setStreamingContent] = useState(''); // live tokens
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -24,6 +25,7 @@ function App() {
     setMessages(nextMessages);
     setInput('');
     setIsLoading(true);
+    setStreamingContent('');
 
     try {
       const res = await fetch(`${API_URL}/api/chat`, {
@@ -32,20 +34,61 @@ function App() {
         body: JSON.stringify({ messages: nextMessages }),
       });
 
+      // Rate-limit / validation errors come back as plain JSON (not a stream)
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.error || `Server error ${res.status}`);
       }
 
-      const data = await res.json();
-      setMessages((prev) => [...prev, { role: 'assistant', content: data.reply }]);
+      // ── Read the SSE stream ──────────────────────────────────────────────
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulated = '';
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE events are separated by double newlines
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop(); // keep incomplete tail
+
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data:')) continue;
+
+          const raw = line.slice(5).trim();
+          if (raw === '[DONE]') break;
+
+          try {
+            const parsed = JSON.parse(raw);
+
+            if (parsed.error) throw new Error(parsed.error);
+
+            if (parsed.delta) {
+              accumulated += parsed.delta;
+              setStreamingContent(accumulated);
+            }
+          } catch (parseErr) {
+            // Ignore malformed chunks
+          }
+        }
+      }
+
+      // Commit the complete reply to the message list
+      const finalReply = accumulated || 'The guardian is silent...';
+      setMessages((prev) => [...prev, { role: 'assistant', content: finalReply }]);
     } catch (err) {
       console.error(err);
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: `Error: ${err.message}` },
+        { role: 'assistant', content: `⚠ ${err.message}` },
       ]);
     } finally {
+      setStreamingContent('');
       setIsLoading(false);
       inputRef.current?.focus();
     }
@@ -180,8 +223,8 @@ function App() {
           );
         })}
 
-        {/* Typing indicator */}
-        {isLoading && (
+        {/* Typing indicator — only shown while waiting for first token */}
+        {isLoading && streamingContent === '' && (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '4px' }}>
             <div style={{ fontSize: '0.65rem', color: '#00ff95', letterSpacing: '0.1em', textTransform: 'uppercase', fontWeight: 600, padding: '0 0.5rem' }}>
               ▸ guardian@ai
@@ -200,6 +243,40 @@ function App() {
                   animation: `blink 1.2s ease-in-out ${d * 0.2}s infinite`,
                 }} />
               ))}
+            </div>
+          </div>
+        )}
+
+        {/* Live streaming bubble — grows token by token */}
+        {streamingContent !== '' && (
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '4px' }}>
+            <div style={{ fontSize: '0.65rem', color: '#00ff95', letterSpacing: '0.1em', textTransform: 'uppercase', fontWeight: 600, padding: '0 0.5rem' }}>
+              ▸ guardian@ai
+            </div>
+            <div style={{
+              maxWidth: '70%',
+              padding: '0.75rem 1rem',
+              borderRadius: '16px 16px 16px 4px',
+              background: 'linear-gradient(135deg, #0f1923 0%, #131e2e 100%)',
+              border: '1px solid #00ff9220',
+              boxShadow: '0 4px 20px #00ff9210',
+              color: '#94a3b8',
+              fontSize: '0.875rem',
+              lineHeight: 1.7,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+            }}>
+              {streamingContent}
+              {/* Blinking cursor at end of stream */}
+              <span style={{
+                display: 'inline-block',
+                width: '2px',
+                height: '1em',
+                background: '#00ff95',
+                marginLeft: '2px',
+                verticalAlign: 'text-bottom',
+                animation: 'pulse 0.8s ease-in-out infinite',
+              }} />
             </div>
           </div>
         )}
